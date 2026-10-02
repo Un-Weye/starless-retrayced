@@ -1,8 +1,6 @@
 # [Python Black Hole Raytracer](http://rantonels.github.io/starless)
 
-Starless is a CPU black hole raytracer in numpy suitable for both informative diagrams and decent wallpaper material.
-
-It is still in development and will be presented on my site along with [my real time black hole visualizer](http://spiro.fisica.unipd.it/~antonell/schwarzschild). Starless, instead, is not real time but offers greater functionality, performing actual raytracing (while the mentioned WebGL applet uses a precomputed lookup texture for deflection).
+Starless-retrayced is a CPU black hole raytracer in numpy suitable for both informative diagrams and decent wallpaper material, bult on the base of [rantonels starless](http://rantonels.github.io/starless)
 
 ## Features
 
@@ -23,7 +21,8 @@ It is still in development and will be presented on my site along with [my real 
 - Kerr geometry (rotating black holes with frame dragging)
 - Integration of time variable, time dependent objects (e.g. orbiting sphere with retarded time rendering) with worldtube-null geodesic intersection
 - Generic redshift framework for solid colour objects
+- GPU compatible raytracing
 
 ## Installation and usage
 
-Please refer to the [Wiki](https://github.com/rantonels/starless/wiki).
+Please refer to the [Wiki](https://github.com/Un-Weye/starless-retrayced/wiki).
