@@ -1,9 +1,13 @@
 #!/usr/bin/python
-
 import numpy as np
+import numpy as xp
+from queue import Empty
+import multiprocessing as mp
+mp.set_start_method("fork")
+from PIL import Image
 import matplotlib.pyplot as plt
 import scipy.ndimage as ndim
-import scipy.misc as spm
+import imageio.v2 as spm
 import random,sys,time,os
 import datetime
 
@@ -31,6 +35,7 @@ import curses
 METH_LEAPFROG = 0
 METH_RK4 = 1
 
+logger.debug(f"xp = {xp.__name__}")
 
 #rough option parsing
 LOFI = False
@@ -152,13 +157,15 @@ DT_TEXTURE = 1
 DT_SOLID = 2
 DT_GRID = 3
 DT_BLACKBODY = 4
+DT_HYBRID = 5
 
 dt_dict = {
         "none":DT_NONE,
         "texture":DT_TEXTURE,
         "solid":DT_SOLID,
         "grid":DT_GRID,
-        "blackbody":DT_BLACKBODY
+        "blackbody":DT_BLACKBODY,
+        "hybrid":DT_HYBRID
     }
 
 #this section works, but only if the .scene file is good
@@ -186,15 +193,15 @@ if not LOFI:
 try:
     CAMERA_POS = [float(x) for x in cfp.get('geometry','Cameraposition').split(',')]
     TANFOV = float(cfp.get('geometry','Fieldofview'))
-    LOOKAT = np.array([float(x) for x in cfp.get('geometry','Lookat').split(',')])
-    UPVEC = np.array([float(x) for x in cfp.get('geometry','Upvector').split(',')])
+    LOOKAT = xp.array([float(x) for x in cfp.get('geometry','Lookat').split(',')])
+    UPVEC = xp.array([float(x) for x in cfp.get('geometry','Upvector').split(',')])
     DISTORT = int(cfp.get('geometry','Distort'))
     DISKINNER = float(cfp.get('geometry','Diskinner'))
     DISKOUTER = float(cfp.get('geometry','Diskouter'))
 
     #options for 'blackbody' disktexture
     DISK_MULTIPLIER = float(cfp.get('materials','Diskmultiplier'))
-    #DISK_ALPHA_MULTIPLIER = float(cfp.get('materials','Diskalphamultiplier'))
+    DISK_ALPHA_MULTIPLIER = float(cfp.get('materials','Diskalphamultiplier'))
     DISK_INTENSITY_DO = int(cfp.get('materials','Diskintensitydo'))
     REDSHIFT = float(cfp.get('materials','Redshift'))
 
@@ -245,14 +252,14 @@ except KeyError:
 
 logger.debug("%dx%d", RESOLUTION[0], RESOLUTION[1])
 
-#just ensuring it's an np.array() and not a tuple/list
-CAMERA_POS = np.array(CAMERA_POS)
+#just ensuring it's an xp.array() and not a tuple/list
+CAMERA_POS = xp.array(CAMERA_POS)
 
 
 #ensure the observer's 4-velocity is timelike
 #since as of now the observer is schwarzschild stationary, we just need to check
 #whether he's outside the horizon.
-if np.linalg.norm(CAMERA_POS) <= 1.:
+if xp.linalg.norm(CAMERA_POS) <= 1.:
     logger.debug("Error: the observer's 4-velocity is not timelike.")
     logger.debug("(try placing the observer outside the event horizon)")
     sys.exit(1)
@@ -278,10 +285,10 @@ if DRAWGRAPH:
     figure = plt.gcf()
 
     ax = plt.gca()
-    
+
     ax.cla()
-    
-    gscale = 1.1*np.linalg.norm(CAMERA_POS)
+
+    gscale = 1.1*xp.linalg.norm(CAMERA_POS)
     ax.set_xlim((-gscale,gscale))
     ax.set_ylim((-gscale,gscale))
     ax.set_aspect('equal')
@@ -290,8 +297,8 @@ if DRAWGRAPH:
 
 
     ax.plot([CAMERA_POS[2],LOOKAT[2]] , [CAMERA_POS[0],LOOKAT[0]] , color='0.05', linestyle='-')
-    
- 
+
+
     figure.gca().add_artist(g_diskout)
     figure.gca().add_artist(g_diskin)
     figure.gca().add_artist(g_horizon)
@@ -313,52 +320,61 @@ def rgbtosrgb(arr):
     arr[mask] **= 1/2.4
     arr[mask] *= 1.055
     arr[mask] -= 0.055
-    arr[-mask] *= 12.92
+    arr[~mask] *= 12.92
 
 
 # convert from srgb to linear rgb
 def srgbtorgb(arr):
     logger.debug("sRGB -> RGB...")
+
     mask = arr > 0.04045
-    arr[mask] += 0.055
-    arr[mask] /= 1.055
-    arr[mask] **= 2.4
-    arr[-mask] /= 12.92
+
+    arr[mask] = ((arr[mask] + 0.055) / 1.055) ** 2.4
+    arr[~mask] = arr[~mask] / 12.92
 
 
 logger.debug("Loading textures...")
+
 if SKY_TEXTURE == 'texture':
-    texarr_sky = spm.imread('textures/bgedit.jpg')
-    # must convert to float here so we can work in linear colour
-    texarr_sky = texarr_sky.astype(float)
-    texarr_sky /= 255.0
+    # load using Pillow and convert to float array in range [0,1]
+    im = Image.open('textures/bgedit.jpg').convert('RGB')
+    texarr_sky = xp.array(im, dtype=float) / 255.0
+
     if SRGBIN:
         # must do this before resizing to get correct results
         srgbtorgb(texarr_sky)
+
     if not LOFI:
-        #   maybe doing this manually and then loading is better.
         logger.debug("(zooming sky texture...)")
-        texarr_sky = spm.imresize(texarr_sky,2.0,interp='bicubic')
-        # imresize converts back to uint8 for whatever reason
-        texarr_sky = texarr_sky.astype(float)
-        texarr_sky /= 255.0
+
+        # resize using PIL
+        im2 = Image.fromarray(
+            (texarr_sky * 255).clip(0, 255).astype(np.uint8)
+        )
+        im2 = im2.resize(
+            (int(im2.width * 2.0), int(im2.height * 2.0)),
+            resample=Image.BICUBIC
+        )
+        texarr_sky = xp.array(im2, dtype=float) / 255.0
+
+        print("SKY TEXTURE:", texarr_sky.shape)
 
 texarr_disk = None
-if DISK_TEXTURE == 'texture':
-    texarr_disk = spm.imread('textures/adisk.jpg')
+if DISK_TEXTURE in ('texture', 'hybrid'):
+        im = Image.open('textures/adisk.jpg').convert('RGB')
+        texarr_disk = xp.array(im, dtype=float) / 255.0
 if DISK_TEXTURE == 'test':
-    texarr_disk = spm.imread('textures/adisktest.jpg')
+   im = Image.open('textures/adisktest.jpg').convert('RGB')
+   texarr_disk = xp.array(im, dtype=float) / 255.0
 if texarr_disk is not None:
-    # must convert to float here so we can work in linear colour
-    texarr_disk = texarr_disk.astype(float)
-    texarr_disk /= 255.0
+
     if SRGBIN:
         srgbtorgb(texarr_disk)
 
 
 #defining texture lookup
 def lookup(texarr,uvarrin): #uvarrin is an array of uv coordinates
-    uvarr = np.clip(uvarrin,0.0,0.999)
+    uvarr = xp.clip(uvarrin,0.0,0.999)
 
     uvarr[:,0] *= float(texarr.shape[1])
     uvarr[:,1] *= float(texarr.shape[0])
@@ -374,14 +390,14 @@ logger.debug("Computing rotation matrix...")
 # this is just standard CGI vector algebra
 
 FRONTVEC = (LOOKAT-CAMERA_POS)
-FRONTVEC = FRONTVEC / np.linalg.norm(FRONTVEC)
+FRONTVEC = FRONTVEC / xp.linalg.norm(FRONTVEC)
 
-LEFTVEC = np.cross(UPVEC,FRONTVEC)
-LEFTVEC = LEFTVEC/np.linalg.norm(LEFTVEC)
+LEFTVEC = xp.cross(UPVEC,FRONTVEC)
+LEFTVEC = LEFTVEC/xp.linalg.norm(LEFTVEC)
 
-NUPVEC = np.cross(FRONTVEC,LEFTVEC)
+NUPVEC = xp.cross(FRONTVEC,LEFTVEC)
 
-viewMatrix = np.zeros((3,3))
+viewMatrix = xp.zeros((3,3))
 
 viewMatrix[:,0] = LEFTVEC
 viewMatrix[:,1] = NUPVEC
@@ -389,7 +405,7 @@ viewMatrix[:,2] = FRONTVEC
 
 
 #array [0,1,2,...,numPixels]
-pixelindices = np.arange(0,RESOLUTION[0]*RESOLUTION[1],1)
+pixelindices = xp.arange(0,RESOLUTION[0]*RESOLUTION[1],1)
 
 #total number of pixels
 numPixels = pixelindices.shape[0]
@@ -397,26 +413,26 @@ numPixels = pixelindices.shape[0]
 logger.debug("Generated %d pixel flattened array.", numPixels)
 
 #useful constant arrays
-ones = np.ones((numPixels))
-ones3 = np.ones((numPixels,3))
-UPFIELD = np.outer(ones,np.array([0.,1.,0.]))
+ones = xp.ones((numPixels))
+ones3 = xp.ones((numPixels,3))
+UPFIELD = xp.outer(ones,xp.array([0.,1.,0.]))
 
 #random sample of floats
 ransample = np.random.random_sample((numPixels))
 
 def vec3a(vec): #returns a constant 3-vector array (don't use for varying vectors)
-    return np.outer(ones,vec)
+    return xp.outer(ones,vec)
 
 def vec3(x,y,z):
-    return vec3a(np.array([x,y,z]))
+    return vec3a(xp.array([x,y,z]))
 
 def norm(vec):
     # you might not believe it, but this is the fastest way of doing this
     # there's a stackexchange answer about this
-    return np.sqrt(np.einsum('...i,...i',vec,vec))
+    return xp.sqrt(xp.einsum('...i,...i',vec,vec))
 
 def normalize(vec):
-    #return vec/ (np.outer(norm(vec),np.array([1.,1.,1.])))
+    #return vec/ (xp.outer(norm(vec),xp.array([1.,1.,1.])))
     return vec / (norm(vec)[:,np.newaxis])
 
 # an efficient way of computing the sixth power of r
@@ -425,7 +441,7 @@ def normalize(vec):
 # but not for power(a,3)!
 
 def sqrnorm(vec):
-    return np.einsum('...i,...i',vec,vec)
+    return xp.einsum('...i,...i',vec,vec)
 
 def sixth(v):
     tmp = sqrnorm(v)
@@ -433,16 +449,16 @@ def sixth(v):
 
 
 def RK4f(y,h2):
-    f = np.zeros(y.shape)
+    f = xp.zeros(y.shape)
     f[:,0:3] = y[:,3:6]
-    f[:,3:6] = - 1.5 * h2 * y[:,0:3] / np.power(sqrnorm(y[:,0:3]),2.5)[:,np.newaxis]
+    f[:,3:6] = - 1.5 * h2 * y[:,0:3] / xp.power(sqrnorm(y[:,0:3]),2.5)[:,np.newaxis]
     return f
 
 
 # this blends colours ca and cb by placing ca in front of cb
 def blendcolors(cb,balpha,ca,aalpha):
-            #* np.outer(aalpha, np.array([1.,1.,1.])) + \
-    #return  ca + cb * np.outer(balpha*(1.-aalpha),np.array([1.,1.,1.]))
+            #* xp.outer(aalpha, xp.array([1.,1.,1.])) + \
+    #return  ca + cb * xp.outer(balpha*(1.-aalpha),xp.array([1.,1.,1.]))
     return  ca + cb * (balpha*(1.-aalpha))[:,np.newaxis]
 
 
@@ -454,9 +470,9 @@ def blendalpha(balpha,aalpha):
 def saveToImg(arr,fname):
     logger.debug(" - saving %s...", fname)
     #copy
-    imgout = np.array(arr)
+    imgout = xp.array(arr)
     #clip
-    imgout = np.clip(imgout,0.0,1.0)
+    imgout = xp.clip(imgout,0.0,1.0)
     #rgb->srgb
     if SRGBOUT:
         rgbtosrgb(imgout)
@@ -466,14 +482,14 @@ def saveToImg(arr,fname):
 
 # this is not just for bool, also for floats (as grayscale)
 def saveToImgBool(arr,fname):
-    saveToImg(np.outer(arr,np.array([1.,1.,1.])),fname)
+    saveToImg(xp.outer(arr,xp.array([1.,1.,1.])),fname)
 
 
 #for shared arrays
 
 def tonumpyarray(mp_arr):
     a = np.frombuffer(mp_arr.get_obj(), dtype=np.float32)
-    a.shape = ((numPixels,3))
+    a = a.reshape((numPixels,3))
     return a
 
 
@@ -486,7 +502,7 @@ def tonumpyarray(mp_arr):
 #CHUNKSIZE = 9000
 if not DISABLE_SHUFFLING:
     np.random.shuffle(pixelindices)
-chunks = np.array_split(pixelindices,numPixels/CHUNKSIZE + 1)
+chunks = xp.array_split(pixelindices,int(numPixels/CHUNKSIZE) + 1)
 
 NCHUNKS = len(chunks)
 
@@ -519,7 +535,7 @@ q,r = divmod(NCHUNKS, NTHREADS)
 indices = [q*i + min(i,r) for i in range(NTHREADS+1)]
 
 for i in range(NTHREADS):
-    schedules.append(chunks[ indices[i]:indices[i+1] ]) 
+    schedules.append(chunks[ indices[i]:indices[i+1] ])
 
 
 
@@ -542,7 +558,7 @@ killers = [False for i in range(NTHREADS)]
 # command line output
 
 class Outputter:
-    def name(self,num):
+    def name(self, num):
         if num == -1:
             return "M"
         else:
@@ -551,42 +567,91 @@ class Outputter:
     def __init__(self):
         self.message = {}
         self.queue = multi.Queue()
-        self.stdscr = curses.initscr()
-        curses.noecho()
+        self.have_curses = False
+
+        try:
+            import curses
+            self.curses = curses
+            self.stdscr = curses.initscr()
+            curses.noecho()
+            self.have_curses = True
+        except Exception:
+            # headless or no curses available
+            self.have_curses = False
 
         for i in range(NTHREADS):
             self.message[i] = "..."
+
         self.message[-1] = "..."
+        self._display_started = False
+
+    def start_display(self):
+        if not self._display_started:
+            print("\033[?1049h", end="", flush=True)
+            print("\033[2J\033[H", end="", flush=True)
+            self._display_started = True
+
+    def stop_display(self):
+        if self._display_started:
+            print("\033[?25h", end="", flush=True)
+            print("\033[?1049l", end="", flush=True)
+            self._display_started = False
+
 
     def doprint(self):
-        for i in range(NTHREADS + 1):
-            self.stdscr.addstr(
-                i, 0, self.name(i - 1) + "] " + self.message[i - 1])
-        self.stdscr.refresh()
+        if self.have_curses:
+            for i in range(NTHREADS + 1):
+                line = self.name(i - 1) + "] " + self.message[i - 1]
+                self.stdscr.move(i, 0)
+                self.stdscr.clrtoeol()
+                self.stdscr.addstr(i, 0, line)
+
+            self.stdscr.refresh()
+
+        else:
+            self.start_display()
+
+            lines = [
+                f"{self.name(i)}: {self.message[i]}"
+                for i in sorted(self.message)
+            ]
+
+            # Go to the top-left of the alternate screen.
+            print("\033[H", end="")
+
+            # Draw the complete status screen.
+            for line in lines:
+                print("\033[2K" + line)
+
+            # Put the cursor back at the top for the next refresh.
+            print(f"\033[{len(lines)}A", end="", flush=True)
 
     def parsemessages(self):
         doref = False
-        while not self.queue.empty():
-            i,m = self.queue.get()
+
+        while True:
+            try:
+                i, m = self.queue.get_nowait()
+            except Empty:
+                break
+
             self.setmessage(m, i)
             doref = True
 
         if doref:
             self.doprint()
 
-    def setmessage(self,mess,i):
-        self.message[i] = mess.ljust(60)
-        #self.doprint()
+    def setmessage(self, mess, i):
+        self.message[i] = str(mess)
 
     def __del__(self):
         try:
-            curses.echo()
-            curses.endwin()
-            print('\n'*(NTHREADS+1))
-        except:
+            if self.have_curses:
+                self.curses.echo()
+                self.curses.endwin()
+                print("\n" * (NTHREADS + 1))
+        except Exception:
             pass
-
-output = Outputter()
 
 def format_time(secs):
     if secs < 60:
@@ -607,7 +672,7 @@ def showprogress(messtring,i,queue):
         ETA = 0
 
     mes = "%d%%, %s remaining. Chunk %d/%d, %s"%(
-            int(100*progress), 
+            int(100*progress),
             format_time(ETA),
             chnkcounters[i],
             len(schedules[i]),
@@ -640,20 +705,20 @@ def raytrace_schedule(i,schedule,total_shared,q): # this is the function running
         #number of chunk pixels
         numChunk = chunk.shape[0]
 
-        #useful constant arrays 
-        ones = np.ones((numChunk))
-        ones3 = np.ones((numChunk,3))
-        UPFIELD = np.outer(ones,np.array([0.,1.,0.]))
-        BLACK = np.outer(ones,np.array([0.,0.,0.]))
+        #useful constant arrays
+        ones = xp.ones((numChunk))
+        ones3 = xp.ones((numChunk,3))
+        UPFIELD = xp.outer(ones,xp.array([0.,1.,0.]))
+        BLACK = xp.outer(ones,xp.array([0.,0.,0.]))
 
         #arrays of integer pixel coordinates
         x = chunk % RESOLUTION[0]
-        y = chunk / RESOLUTION[0]
+        y = chunk // RESOLUTION[0]
 
         showprogress("Generating view vectors...",i,q)
 
         #the view vector in 3D space
-        view = np.zeros((numChunk,3))
+        view = xp.zeros((numChunk,3))
 
         view[:,0] = x.astype(float)/RESOLUTION[0] - .5
         view[:,1] = ((-y.astype(float)/RESOLUTION[1] + .5)*RESOLUTION[1])/RESOLUTION[0] #(inverting y coordinate)
@@ -664,10 +729,10 @@ def raytrace_schedule(i,schedule,total_shared,q): # this is the function running
 
         #rotating through the view matrix
 
-        view = np.einsum('jk,ik->ij',viewMatrix,view)
+        view = xp.einsum('jk,ik->ij',viewMatrix,view)
 
         #original position
-        point = np.outer(ones, CAMERA_POS)
+        point = xp.outer(ones, CAMERA_POS)
 
         normview = normalize(view)
 
@@ -675,12 +740,12 @@ def raytrace_schedule(i,schedule,total_shared,q): # this is the function running
 
 
         # initializing the colour buffer
-        object_colour = np.zeros((numChunk,3))
-        object_alpha = np.zeros(numChunk)
+        object_colour = xp.zeros((numChunk,3))
+        object_alpha = xp.zeros(numChunk)
 
         #squared angular momentum per unit mass (in the "Newtonian fantasy")
-        #h2 = np.outer(sqrnorm(np.cross(point,velocity)),np.array([1.,1.,1.]))
-        h2 = sqrnorm(np.cross(point,velocity))[:,np.newaxis]
+        #h2 = xp.outer(sqrnorm(xp.cross(point,velocity)),xp.array([1.,1.,1.]))
+        h2 = sqrnorm(xp.cross(point,velocity))[:,np.newaxis]
 
         pointsqr = np.copy(ones3)
 
@@ -701,7 +766,7 @@ def raytrace_schedule(i,schedule,total_shared,q): # this is the function running
 
                 if DISTORT:
                     #this is the magical - 3/2 r^(-5) potential...
-                    accel = - 1.5 * h2 *  point / np.power(sqrnorm(point),2.5)[:,np.newaxis]
+                    accel = - 1.5 * h2 *  point / xp.power(sqrnorm(point),2.5)[:,np.newaxis]
                     velocity += accel * STEP
 
             elif METHOD == METH_RK4:
@@ -710,7 +775,7 @@ def raytrace_schedule(i,schedule,total_shared,q): # this is the function running
                     rkstep = STEP
 
                     # standard Runge-Kutta
-                    y = np.zeros((numChunk,6))
+                    y = xp.zeros((numChunk,6))
                     y[:,0:3] = point
                     y[:,3:6] = velocity
                     k1 = RK4f( y, h2)
@@ -719,7 +784,7 @@ def raytrace_schedule(i,schedule,total_shared,q): # this is the function running
                     k4 = RK4f( y +     rkstep*k3, h2)
 
                     increment = rkstep/6. * (k1 + 2*k2 + 2*k3 + k4)
-                    
+
                     velocity += increment[:,3:6]
 
                 point += increment[:,0:3]
@@ -727,15 +792,15 @@ def raytrace_schedule(i,schedule,total_shared,q): # this is the function running
 
             #useful precalcs
             pointsqr = sqrnorm(point)
-            #phi = np.arctan2(point[:,0],point[:,2])    #too heavy. Better an instance wherever it's needed.
+            #phi = xp.arctan2(point[:,0],point[:,2])    #too heavy. Better an instance wherever it's needed.
             #normvel = normalize(velocity)              #never used! BAD BAD BAD!!
 
 
             # FOG
 
             if FOGDO and (it%FOGSKIP == 0):
-                phsphtaper = np.clip(0.8*(pointsqr - 1.0),0.,1.0)
-                fogint = np.clip(FOGMULT * FOGSKIP * STEP / pointsqr,0.0,1.0) * phsphtaper
+                phsphtaper = xp.clip(0.8*(pointsqr - 1.0),0.,1.0)
+                fogint = xp.clip(FOGMULT * FOGSKIP * STEP / pointsqr,0.0,1.0) * phsphtaper
                 fogcol = ones3
 
                 object_colour = blendcolors(fogcol,fogint,object_colour,object_alpha)
@@ -747,77 +812,170 @@ def raytrace_schedule(i,schedule,total_shared,q): # this is the function running
 
             if DISK_TEXTURE_INT != DT_NONE:
 
-                mask_crossing = np.logical_xor( oldpoint[:,1] > 0., point[:,1] > 0.) #whether it just crossed the horizontal plane
-                mask_distance = np.logical_and((pointsqr < DISKOUTERSQR), (pointsqr > DISKINNERSQR))  #whether it's close enough
+                mask_crossing = xp.logical_xor( oldpoint[:,1] > 0., point[:,1] > 0.) #whether it just crossed the horizontal plane
+                mask_distance = xp.logical_and((pointsqr < DISKOUTERSQR), (pointsqr > DISKINNERSQR))  #whether it's close enough
 
-                diskmask = np.logical_and(mask_crossing,mask_distance)
+                diskmask = xp.logical_and(mask_crossing,mask_distance)
 
                 if (diskmask.any()):
-                    
+
                     #actual collision point by intersection
                     lambdaa = - point[:,1]/velocity[:,1]
                     colpoint = point + lambdaa[:,np.newaxis] * velocity
                     colpointsqr = sqrnorm(colpoint)
 
                     if DISK_TEXTURE_INT == DT_GRID:
-                        phi = np.arctan2(colpoint[:,0],point[:,2])
-                        theta = np.arctan2(colpoint[:,1],norm(point[:,[0,2]]))
-                        diskcolor =     np.outer(
-                                np.mod(phi,0.52359) < 0.261799,
-                                            np.array([1.,1.,0.])
+                        phi = xp.arctan2(colpoint[:,0],point[:,2])
+                        theta = xp.arctan2(colpoint[:,1],norm(colpoint[:,[0,2]]))
+                        diskcolor =     xp.outer(
+                                xp.mod(phi,0.52359) < 0.261799,
+                                            xp.array([1.,1.,0.])
                                                 ) +  \
-                                        np.outer(ones,np.array([0.,0.,1.]) )
+                                        xp.outer(ones,xp.array([0.,0.,1.]) )
                         diskalpha = diskmask
 
                     elif DISK_TEXTURE_INT == DT_SOLID:
-                        diskcolor = np.array([1.,1.,.98])
+                        diskcolor = xp.array([1.,1.,.98])
                         diskalpha = diskmask
 
                     elif DISK_TEXTURE_INT == DT_TEXTURE:
 
-                        phi = np.arctan2(colpoint[:,0],point[:,2])
-                        
-                        uv = np.zeros((numChunk,2))
+                        phi = xp.arctan2(colpoint[:,0],point[:,2])
+
+                        uv = xp.zeros((numChunk,2))
 
                         uv[:,0] = ((phi+2*np.pi)%(2*np.pi))/(2*np.pi)
-                        uv[:,1] = (np.sqrt(colpointsqr)-DISKINNER)/(DISKOUTER-DISKINNER)
+                        uv[:,1] = (xp.sqrt(colpointsqr)-DISKINNER)/(DISKOUTER-DISKINNER)
 
-                        diskcolor = lookup ( texarr_disk, np.clip(uv,0.,1.))
+                        diskcolor = lookup ( texarr_disk, xp.clip(uv,0.,1.))
                         #alphamask = (2.0*ransample) < sqrnorm(diskcolor)
-                        #diskmask = np.logical_and(diskmask, alphamask )
-                        diskalpha = diskmask * np.clip(sqrnorm(diskcolor)/3.0,0.0,1.0)
+                        #diskmask = xp.logical_and(diskmask, alphamask )
+                        diskalpha = diskmask * xp.clip(sqrnorm(diskcolor)/3.0,0.0,1.0)
 
                     elif DISK_TEXTURE_INT == DT_BLACKBODY:
 
-                        temperature = np.exp(bb.disktemp(colpointsqr,9.2103))
+                        temperature = xp.exp(bb.disktemp(colpointsqr,9.2103))
 
                         if REDSHIFT:
-                            R = np.sqrt(colpointsqr)
+                            R = xp.sqrt(colpointsqr)
 
                             disc_velocity = 0.70710678 * \
-                                        np.power((np.sqrt(colpointsqr)-1.).clip(0.1),-.5)[:,np.newaxis] * \
-                                        np.cross(UPFIELD, normalize(colpoint))
+                                        xp.power((xp.sqrt(colpointsqr)-1.).clip(0.1),-.5)[:,np.newaxis] * \
+                                        xp.cross(UPFIELD, normalize(colpoint))
 
 
-                            gamma =  np.power( 1 - sqrnorm(disc_velocity).clip(max=.99), -.5)
+                            gamma =  xp.power( 1 - sqrnorm(disc_velocity).clip(max=.99), -.5)
 
                             # opz = 1 + z
-                            opz_doppler = gamma * ( 1. + np.einsum('ij,ij->i',disc_velocity,normalize(velocity)))
-                            opz_gravitational = np.power(1.- 1/R.clip(1),-.5)
+                            opz_doppler = gamma * ( 1. + xp.einsum('ij,ij->i',disc_velocity,normalize(velocity)))
+                            opz_gravitational = xp.power(
+                                xp.maximum(1. - 1. / R, 1e-12),
+                                -0.5
+                                )
 
                             # (1+z)-redshifted Planck spectrum is still Planckian at temperature T
                             temperature /= (opz_doppler*opz_gravitational).clip(0.1)
 
                         intensity = bb.intensity(temperature)
                         if DISK_INTENSITY_DO:
-                            diskcolor = np.einsum('ij,i->ij', bb.colour(temperature),DISK_MULTIPLIER*intensity)#np.maximum(1.*ones,DISK_MULTIPLIER*intensity))
+                            diskcolor = xp.einsum('ij,i->ij', bb.colour(temperature),DISK_MULTIPLIER*intensity)#xp.maximum(1.*ones,DISK_MULTIPLIER*intensity))
                         else:
                             diskcolor = bb.colour(temperature)
 
-                        iscotaper = np.clip((colpointsqr-DISKINNERSQR)*0.3,0.,1.)
-                        outertaper = np.clip(temperature/1000. ,0.,1.)
+                        diskalpha = xp.clip(
+                            diskmask * DISK_ALPHA_MULTIPLIER * intensity,
+                            0.,
+                            1.
+                            )
 
-                        diskalpha = diskmask * iscotaper * outertaper#np.clip(diskmask * DISK_ALPHA_MULTIPLIER *intensity,0.,1.)
+                    elif DISK_TEXTURE_INT == DT_HYBRID:
+
+                        # Blackbody provides the physical colour and brightness
+                        temperature = xp.exp(bb.disktemp(colpointsqr,9.2103))
+
+                        if REDSHIFT:
+                            R = xp.sqrt(colpointsqr)
+
+                            disc_velocity = 0.70710678 * \
+                                        xp.power((xp.sqrt(colpointsqr)-1.).clip(0.1),-.5)[:,np.newaxis] * \
+                                        xp.cross(UPFIELD, normalize(colpoint))
+
+                            gamma = xp.power(
+                                1 - sqrnorm(disc_velocity).clip(max=.99),
+                                -.5
+                            )
+
+                            opz_doppler = gamma * (
+                                1. + xp.einsum(
+                                    'ij,ij->i',
+                                    disc_velocity,
+                                    normalize(velocity)
+                                )
+                            )
+
+                            opz_gravitational = xp.power(
+                                xp.maximum(1. - 1. / R, 1e-12),
+                                -0.5
+                            )
+
+                            temperature /= (
+                                opz_doppler * opz_gravitational
+                            ).clip(0.1)
+
+                        intensity = bb.intensity(temperature)
+
+                        if DISK_INTENSITY_DO:
+                            diskcolor = xp.einsum(
+                                'ij,i->ij',
+                                bb.colour(temperature),
+                                DISK_MULTIPLIER * intensity
+                            )
+                        else:
+                            diskcolor = bb.colour(temperature)
+
+                        # Get the same texture coordinates used by the
+                        # normal texture disk renderer.
+                        phi = xp.arctan2(colpoint[:,0],point[:,2])
+
+                        uv = xp.zeros((numChunk,2))
+
+                        uv[:,0] = ((phi+2*np.pi)%(2*np.pi))/(2*np.pi)
+                        uv[:,1] = (
+                            (xp.sqrt(colpointsqr)-DISKINNER)
+                            /(DISKOUTER-DISKINNER)
+                        )
+
+                        disktexture = lookup(
+                            texarr_disk,
+                            xp.clip(uv,0.,1.)
+                        )
+
+                        ## Texture controls the local structure of the blackbody disk.
+                        # Convert RGB texture to luminance.
+                        texture_brightness = (
+                            0.2126 * disktexture[:,0] +
+                            0.7152 * disktexture[:,1] +
+                            0.0722 * disktexture[:,2]
+                        )
+
+                        # Increase contrast so the structure is actually visible.
+                        texture_brightness = xp.clip(
+                            (texture_brightness - 0.5) * 2.0 + 0.5,
+                            0.0,
+                            1.0
+                        )
+
+                        # Modulate the blackbody emission with the texture.
+                        texture_factor = 0.35 + 0.65 * texture_brightness
+
+                        diskcolor *= texture_factor[:,np.newaxis]
+
+                        # Blackbody controls the physical opacity.
+                        diskalpha = xp.clip(
+                            diskmask * DISK_ALPHA_MULTIPLIER * intensity,
+                            0.,
+                            1.
+                        )
 
 
                     object_colour = blendcolors(diskcolor,diskalpha,object_colour,object_alpha)
@@ -828,7 +986,7 @@ def raytrace_schedule(i,schedule,total_shared,q): # this is the function running
             # event horizon
             oldpointsqr = sqrnorm(oldpoint)
 
-            mask_horizon = np.logical_and((pointsqr < 1),(sqrnorm(oldpoint) > 1) )
+            mask_horizon = xp.logical_and((pointsqr < 1),(sqrnorm(oldpoint) > 1) )
 
             if mask_horizon.any() :
 
@@ -836,11 +994,11 @@ def raytrace_schedule(i,schedule,total_shared,q): # this is the function running
                 colpoint = lambdaa * point + (1-lambdaa)*oldpoint
 
                 if HORIZON_GRID:
-                    phi = np.arctan2(colpoint[:,0],point[:,2])
-                    theta = np.arctan2(colpoint[:,1],norm(point[:,[0,2]]))
-                    horizoncolour = np.outer( np.logical_xor(np.mod(phi,1.04719) < 0.52359,np.mod(theta,1.04719) < 0.52359), np.array([1.,0.,0.]))
+                    phi = xp.arctan2(colpoint[:,0],point[:,2])
+                    theta = xp.arctan2(colpoint[:,1],norm(point[:,[0,2]]))
+                    horizoncolour = xp.outer( xp.logical_xor(xp.mod(phi,1.04719) < 0.52359,xp.mod(theta,1.04719) < 0.52359), xp.array([1.,0.,0.]))
                 else:
-                    horizoncolour = BLACK#np.zeros((numPixels,3))
+                    horizoncolour = BLACK#xp.zeros((numPixels,3))
 
                 horizonalpha = mask_horizon
 
@@ -851,12 +1009,12 @@ def raytrace_schedule(i,schedule,total_shared,q): # this is the function running
 
         showprogress("generating sky layer...",i,q)
 
-        vphi = np.arctan2(velocity[:,0],velocity[:,2])
-        vtheta = np.arctan2(velocity[:,1],norm(velocity[:,[0,2]]) )
+        vphi = xp.arctan2(velocity[:,0],velocity[:,2])
+        vtheta = xp.arctan2(velocity[:,1],norm(velocity[:,[0,2]]) )
 
-        vuv = np.zeros((numChunk,2))
+        vuv = xp.zeros((numChunk,2))
 
-        vuv[:,0] = np.mod(vphi+4.5,2*np.pi)/(2*np.pi)
+        vuv[:,0] = xp.mod(vphi+4.5,2*np.pi)/(2*np.pi)
         vuv[:,1] = (vtheta+np.pi/2)/(np.pi)
 
         if SKY_TEXTURE_INT == DT_TEXTURE:
@@ -865,21 +1023,21 @@ def raytrace_schedule(i,schedule,total_shared,q): # this is the function running
         showprogress("generating debug layers...",i,q)
 
         ##debug color: direction of view vector
-        #dbg_viewvec = np.clip(view + vec3(.5,.5,0.0),0.0,1.0)
+        #dbg_viewvec = xp.clip(view + vec3(.5,.5,0.0),0.0,1.0)
         ##debug color: direction of final ray
         ##debug color: grid
-        #dbg_grid = np.abs(normalize(velocity)) < 0.1
+        #dbg_grid = xp.abs(normalize(velocity)) < 0.1
 
 
         if SKY_TEXTURE_INT == ST_TEXTURE:
             col_bg = col_sky
         elif SKY_TEXTURE_INT == ST_NONE:
-            col_bg = np.zeros((numChunk,3))
+            col_bg = xp.zeros((numChunk,3))
         elif SKY_TEXTURE_INT == ST_FINAL:
-            dbg_finvec = np.clip(normalize(velocity) + np.array([.5,.5,0.0])[np.newaxis,:],0.0,1.0)
+            dbg_finvec = xp.clip(normalize(velocity) + xp.array([.5,.5,0.0])[np.newaxis,:],0.0,1.0)
             col_bg = dbg_finvec
         else:
-            col_bg = np.zeros((numChunk,3))
+            col_bg = xp.zeros((numChunk,3))
 
 
         showprogress("blending layers...",i,q)
@@ -908,12 +1066,22 @@ def raytrace_schedule(i,schedule,total_shared,q): # this is the function running
 
 # Threading
 
+# setup
+# Threading
+
+output = Outputter()
+
 process_list = []
 for i in range(NTHREADS):
-    p = multi.Process(target=raytrace_schedule,args=(i,schedules[i],total_colour_buffer_preproc_shared,output.queue))
+    p = multi.Process(
+        target=raytrace_schedule,
+        args=(i, schedules[i], total_colour_buffer_preproc_shared, output.queue)
+    )
     process_list.append(p)
 
 logger.debug("Starting threads...")
+
+output.start_display()
 
 for proc in process_list:
     proc.start()
@@ -921,14 +1089,14 @@ for proc in process_list:
 try:
     refreshcounter = 0
     while True:
-        refreshcounter+=1
+        refreshcounter += 1
         time.sleep(0.1)
-    
+
         output.parsemessages()
 
-        if not DISABLE_DISPLAY and (refreshcounter%40 == 0):
-            output.setmessage("Updating display...",-1)
-            plt.imshow(total_colour_buffer_preproc.reshape((RESOLUTION[1],RESOLUTION[0],3)))
+        if not DISABLE_DISPLAY and (refreshcounter % 40 == 0):
+            output.setmessage("Updating display...", -1)
+            plt.imshow(total_colour_buffer_preproc.reshape((RESOLUTION[1], RESOLUTION[0], 3)))
             plt.draw()
 
         output.setmessage("Idle.", -1)
@@ -937,15 +1105,17 @@ try:
         for i in range(NTHREADS):
             if process_list[i].is_alive():
                 alldone = False
+
         if alldone:
             break
+
 except KeyboardInterrupt:
     for i in range(NTHREADS):
         killers[i] = True
     sys.exit()
 
+output.stop_display()
 del output
-
 
 logger.debug("Done tracing.")
 
@@ -963,11 +1133,11 @@ total_colour_buffer_preproc *= GAIN
 if AIRY_BLOOM:
 
     logger.debug("-computing Airy disk bloom...")
-    
+
     #blending bloom
 
     #colour = total_colour_buffer_preproc + 0.3*blurd #0.2*dbg_grid + 0.8*dbg_finvec
-    
+
     #airy disk bloom
 
     colour_bloomd = np.copy(total_colour_buffer_preproc)
@@ -976,27 +1146,27 @@ if AIRY_BLOOM:
 
     # the float constant is 1.22 * 650nm / (4 mm), the typical diffractive resolution
     # of the human eye for red light. It's in radians, so we rescale using field of view.
-    radd = 0.00019825 * RESOLUTION[0] / np.arctan(TANFOV)
+    radd = 0.00019825 * RESOLUTION[0] / xp.arctan(TANFOV)
 
     # the user is allowed to rescale the resolution, though
-    radd*=AIRY_RADIUS 
+    radd*=AIRY_RADIUS
 
     # the pixel size of the kernel:
     # 25 pixels radius is ok for 5.0 bright source pixel at 1920x1080, so...
-    # remembering that airy ~ 1/x^3, so if we want intensity/x^3 < hreshold => 
+    # remembering that airy ~ 1/x^3, so if we want intensity/x^3 < hreshold =>
     # => max_x = (intensity/threshold)^1/3
-    # so it scales with 
+    # so it scales with
     # - the cube root of maximum intensity
     # - linear in resolution
 
-    mxint = np.amax(colour_bloomd)
+    mxint = xp.amax(colour_bloomd)
 
-    kern_radius = 25 * np.power( np.amax(colour_bloomd) / 5.0 , 1./3.) * RESOLUTION[0]/1920.
+    kern_radius = 25 * xp.power( xp.amax(colour_bloomd) / 5.0 , 1./3.) * RESOLUTION[0]/1920.
 
     logger.debug("--(radius: %3f, kernel pixel radius: %3f, maximum source brightness: %3f)", radd, kern_radius, mxint)
-    
+
     colour_bloomd = bloom.airy_convolve(colour_bloomd,radd)
- 
+
     colour_bloomd = colour_bloomd.reshape((numPixels,3))
 
 
@@ -1010,8 +1180,8 @@ else:
 if BLURDO:
 
     logger.debug("-computing wide gaussian blur...")
-    
-    #hipass = np.outer(sqrnorm(total_colour_buffer_preproc) > BLOOMCUT, np.array([1.,1.,1.])) * total_colour_buffer_preproc
+
+    #hipass = xp.outer(sqrnorm(total_colour_buffer_preproc) > BLOOMCUT, xp.array([1.,1.,1.])) * total_colour_buffer_preproc
     blurd = np.copy(total_colour_buffer_preproc)
 
     blurd = blurd.reshape((RESOLUTION[1],RESOLUTION[0],3))
@@ -1030,13 +1200,13 @@ else:
 #normalization
 if NORMALIZE > 0:
     logger.debug("- normalizing...")
-    colour *= 1 / (NORMALIZE * np.amax(colour.flatten()) )
+    colour *= 1 / (NORMALIZE * xp.amax(colour.flatten()) )
 
 
 
 
 #final colour
-colour = np.clip(colour,0.,1.)
+colour = xp.clip(colour,0.,1.)
 
 
 logger.debug("Conversion to image and saving...")
