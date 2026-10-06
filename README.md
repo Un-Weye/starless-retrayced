@@ -27,7 +27,7 @@ Starless-retrayced is a CPU black hole raytracer in numpy suitable for both info
 
 Please refer to the [Wiki](https://github.com/Un-Weye/starless-retrayced/wiki).
 
-##Credits
+## Credits
 
 Credits to [Rantonels](http://rantonels.github.com) for making the original Starless, I only intend on mantaining it and completing the author's future features
 
