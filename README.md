@@ -1,6 +1,6 @@
 # [Python Black Hole Raytracer](http://rantonels.github.io/starless)
 
-Starless-retrayced is a CPU black hole raytracer in numpy suitable for both informative diagrams and decent wallpaper material, bult on the base of [rantonels starless](http://rantonels.github.io/starless)
+Starless-retrayced is a CPU black hole raytracer in numpy suitable for both informative diagrams and decent wallpaper material, forked of [rantonels starless](http://rantonels.github.io/starless)
 
 ## Features
 
@@ -26,3 +26,8 @@ Starless-retrayced is a CPU black hole raytracer in numpy suitable for both info
 ## Installation and usage
 
 Please refer to the [Wiki](https://github.com/Un-Weye/starless-retrayced/wiki).
+
+##Credits
+
+Credits to [Rantonels](http://rantonels.github.com) for making the original Starless, I only intend on mantaining it and completing the author's future features
+
