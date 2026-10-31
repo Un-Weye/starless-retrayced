@@ -19,7 +19,7 @@ Stepsize=0.17
 # apply when rendering without the -d option
 [hifi]
 
-Resolution=1920,1080
+Resolution=3840,2160
 Iterations=700
 Stepsize=0.08
 
