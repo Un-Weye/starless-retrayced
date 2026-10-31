@@ -20,8 +20,8 @@ Stepsize=0.17
 [hifi]
 
 Resolution=3840,2160
-Iterations=2000
-Stepsize=0.008
+Iterations=800
+Stepsize=0.08
 
 
 # From now on, settings apply to both tests and full renders
